@@ -2,28 +2,33 @@ import asyncio
 import contextlib
 from datetime import datetime
 import json
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
+from app.core.config import settings
 from app.utils.logger import log_execution, custom_logger
 
 from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
+from pydantic import SecretStr
+
+from app.agents.restaurant_agent import get_restaurant_agent
 
 
 class AgentService:
     def __init__(self):
-        # IMP: LangChain을 통해 사용할 LLM(OpenAI) 객체 초기화 구현. 에이전트의 두뇌 역할을 합니다.
-        self.agent = None
-        self.progress_queue: asyncio.Queue = asyncio.Queue()
+        self.model = ChatOpenAI(model=settings.OPENAI_MODEL, api_key=SecretStr(settings.OPENAI_API_KEY))
+        self.checkpointer = MemorySaver()
+        self.agent: Any = None
+        self.progress_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
 
-    def _create_agent(self, thread_id: uuid.UUID = None):
-        """LangChain 에이전트 생성"""
-        # IMP: DeepAgents 라이브러리를 사용하여 LangGraph 기반의 에이전트를 생성하는 구현. 
-        # LLM 모델, 사용할 도구(Tools), 시스템 프롬프트, 상태 저장소(Checkpointer), 그리고 응답 포맷(ToolStrategy)을 결합하여 워크플로우를 초기화합니다.
-        # Agent 생성
-        from app.agents.dummy import Agent
-        self.agent = Agent()
+    def _create_agent(self, thread_id: uuid.UUID | None = None):
+        """Restaurant LangGraph 에이전트 생성"""
+        # Restaurant agent를 사용해 LangGraph 기반 에이전트를 초기화합니다.
+        # model과 checkpointer를 전달하여 스트리밍 및 상태 저장을 지원합니다.
+        self.agent = get_restaurant_agent(self.model, self.checkpointer)
 
     # 실제 대화 로직
     @log_execution
@@ -44,21 +49,25 @@ class AgentService:
             )
 
             agent_iterator = agent_stream.__aiter__()
-            agent_task = asyncio.create_task(agent_iterator.__anext__())
-            progress_task = asyncio.create_task(self.progress_queue.get())
+            agent_task = asyncio.ensure_future(agent_iterator.__anext__())
+            progress_task = asyncio.ensure_future(self.progress_queue.get())
 
             while True:
-                pending = {agent_task}
+                pending: set[asyncio.Future[Any]] = set()
+                if agent_task is not None:
+                    pending.add(agent_task)
                 if progress_task is not None:
                     pending.add(progress_task)
+                if not pending:
+                    break
 
                 done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
 
-                if progress_task in done:
+                if progress_task is not None and progress_task in done:
                     try:
                         progress_event = progress_task.result()
                         yield json.dumps(progress_event, ensure_ascii=False)
-                        progress_task = asyncio.create_task(self.progress_queue.get())
+                        progress_task = asyncio.ensure_future(self.progress_queue.get())
                     except asyncio.CancelledError:
                         progress_task = None
                     except Exception as e:
@@ -66,7 +75,7 @@ class AgentService:
                         custom_logger.error(f"Error in progress_task: {e}")
                         progress_task = None
 
-                if agent_task in done:
+                if agent_task is not None and agent_task in done:
                     try:
                         chunk = agent_task.result()
                     except StopAsyncIteration:
@@ -103,6 +112,10 @@ class AgentService:
                             if step == "model":
                                 tool_calls = message.tool_calls
                                 if not tool_calls:
+                                    raw_content = getattr(message, "content", "") or ""
+                                    if raw_content:
+                                        done_event = self._parse_plain_text_response(raw_content)
+                                        yield json.dumps(done_event, ensure_ascii=False)
                                     continue
                                 tool = tool_calls[0]
                                 if tool.get("name") == "ChatResponse":
@@ -132,7 +145,7 @@ class AgentService:
                         yield json.dumps(error_response, ensure_ascii=False)
                         break
 
-                    agent_task = asyncio.create_task(agent_iterator.__anext__())
+                    agent_task = asyncio.ensure_future(agent_iterator.__anext__())
 
             if progress_task is not None:
                 progress_task.cancel()
@@ -167,11 +180,43 @@ class AgentService:
             }
             yield json.dumps(error_response, ensure_ascii=False)
 
+    def _parse_plain_text_response(self, raw_content: str) -> dict[str, Any]:
+        parsed_id = str(uuid.uuid4())
+        parsed_content = raw_content
+        parsed_metadata: dict[str, Any] = {}
+        try:
+            data = json.loads(raw_content)
+            key_map = {
+                "message_id": ["message_id", "message_id (필수 키값)"],
+                "content": ["content", "content (필수 키값)"],
+                "metadata": ["metadata", "metadata (필수 키값)"],
+            }
+            for target, candidates in key_map.items():
+                for key in candidates:
+                    if key in data:
+                        if target == "message_id":
+                            parsed_id = str(data[key])
+                        elif target == "content":
+                            parsed_content = str(data[key])
+                        elif target == "metadata":
+                            parsed_metadata = data[key] if isinstance(data[key], dict) else {}
+                        break
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return {
+            "step": "done",
+            "message_id": parsed_id,
+            "role": "assistant",
+            "content": parsed_content,
+            "metadata": self._handle_metadata(parsed_metadata),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
     @log_execution
-    def _handle_metadata(self, metadata) -> dict:
+    def _handle_metadata(self, metadata: dict[str, object] | None) -> dict[str, object]:
         custom_logger.info("========================================")
         custom_logger.info(metadata)
-        result = {}
+        result: dict[str, object] = {}
         if metadata:
             for k, v in metadata.items():
                 result[k] = v

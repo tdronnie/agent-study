@@ -1,4 +1,3 @@
-from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -16,12 +15,23 @@ class Settings(BaseSettings):
     # API 설정
     API_V1_PREFIX: str
 
-    CORS_ORIGINS: List[str] = ["*"]
+    CORS_ORIGINS: list[str] = ["*"]
     
     # IMP: LangChain 객체 및 LLM 연동에 사용되는 필수 설정값(API Key 등)
     # LangChain 설정
     OPENAI_API_KEY: str
     OPENAI_MODEL: str
+
+    # Elasticsearch 설정
+    ELASTICSEARCH_URL: str = Field(default="http://localhost:9200", description="Elasticsearch base URL")
+    ELASTICSEARCH_INDEX: str = Field(default="restaurants", description="Elasticsearch index name")
+    ELASTICSEARCH_API_KEY: str = Field(default="", description="Elasticsearch API key")
+    ELASTICSEARCH_USERNAME: str | None = Field(default=None, description="Elasticsearch username")
+    ELASTICSEARCH_PASSWORD: str | None = Field(default=None, description="Elasticsearch password")
+
+    # 음식점 openAPI 설정
+    REST_URL: str = Field(default="", description="Restaurant OpenAPI base URL")
+    REST_API_KEY: str = Field(default="", description="Restaurant OpenAPI key")
     
     # 기본 설정 (추가 환경변수가 필요하면 여기에 추가하세요)
 
@@ -39,5 +49,5 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-settings = Settings()
 
+settings = Settings()  # pyright: ignore[reportCallIssue]
